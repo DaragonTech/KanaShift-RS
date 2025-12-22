@@ -1,0 +1,3 @@
+[workspace]
+members = ["kanashift", "kanashift_app"]
+resolver = "2"

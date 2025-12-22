@@ -1,0 +1,8 @@
+[package]
+name = "phonoshift_app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+phonoshift = { path = "../phonoshift" }
+eframe = "0.29"
