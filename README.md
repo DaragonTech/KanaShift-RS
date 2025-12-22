@@ -1,26 +1,22 @@
 ![cover-v5-optimized](./kanashift-cover.gif)
 
-**This is a port of KanaShift and PhonoShift to Rust language.**
+**This is a Rust port of KanaShift and PhonoShift - hardened text transmutation engines.**
 
 # KanaShift & PhonoShift
 
-**Password-based text transformation that renders text with a Japanese visual skin. Looks Japanese, translates to something else, decodes back to the truth.**
+**Reversible, format-preserving text transformation with a Japanese visual skin.
+Looks Japanese. Means something else. Decodes back to the truth.**
 
 ## Overview
 
-KanaShift is a password-based text obfuscation scheme for Latin and Japanese text, preserving separators and tokens. Just like its sibling PhonoShift (ROT500K), also available in this repository, KanaShift is intentionally hardened using cryptographic primitives to make reversal without the password costly.
+KanaShift and its sibling PhonoShift (ROT500K) use a PBKDF2-derived keystream with 500,000 iterations, making every password guess deliberately expensive.
 
-Internally, ROT500K derives a keystream using PBKDF2 with 500,000 iterations (“500K”), making each password guess deliberately slow.
-Unlike ROT13, which can be reversed instantly by anyone, reversal here requires guessing the correct password.
+This is not ROT13 repeated.
+It’s a keyed design where reversal without the secret is no longer trivial.
 
-The name “ROT500K” is a deliberate nod to ROT13, partly as a joke and partly to underline the contrast:
-this is not ROT13 repeated many times, but a keyed design where reversal without the secret is no longer trivial.
+KanaShift applies the same hardened mechanics with kana and kanji, preserving structure while shifting the surface.
 
-KanaShift applies the same mechanics with a different visual skin, rendering text using Japanese writing systems (kana and kanji) instead of Latin letters.
-
-Initial implementations of PhonoShift and KanaShift are available as a standalone HTML/JS, a Python port with Gradio, and a cross-platform Rust app, making the design easy to test and review across environments.
-
-For the Rust implementation, performance measurements assume a release build, as debug builds can significantly slow down encoding and decoding.
+For performance reasons, use release builds, as debug compilation significantly affects runtime.
 
 ## Live Demos
 
@@ -54,24 +50,18 @@ The salt value (e.g. `NameFPE:v1`) acts as a domain and version separator rather
 
 ---
 
-### Security posture and Use cases
+## What This Is (and Is Not)
 
-KanaShift is neither “weak obfuscation” nor “strong encryption”.
-It is best understood as **cryptographically hardened obfuscation**: it uses real cryptographic primitives to make reversal expensive, while intentionally preserving text structure and usability.
+KanaShift is not encryption. It’s a reversible, password-based masking system focused on format preservation, visual disguise, and recoverability.
 
-With a strong 16-character password, guessing becomes extremely impractical, but the design does not provide the guarantees of modern authenticated encryption (AEAD) and is not intended as a drop-in replacement for it.
+---
 
-KanaShift is designed for reversible masking of human-readable text in UIs, logs, demos, and identifiers, where stable tokenization, copy/paste friendliness, and visually plausible output matter.
-The PBKDF2 500K setting increases the cost of password guessing, but does not turn the output into conventional ciphertext.
+## Performance & Security
 
-As an open-source project, its strength comes from scrutiny rather than secrecy; any weaknesses are expected to surface through review rather than obscurity.
+A PBKDF2 - derived keystream imposes real cost per password guess (default 500K iterations), tuned for short, interactive text.
+Iterations can be lowered for batch use, trading resistance for throughput.
 
-### Calibration
-
-The default 500,000-iteration setting was calibrated on a macOS Mac mini (M4 Pro),
-where it produces an encode/decode time of about 200 ms in a browser environment.
-This targets a “slow but usable” cost comparable in wall-clock time to common bcrypt
-deployments (for example, cost factor 12), without claiming the same security properties.
+KanaShift uses real crypto primitives but keeps output human-readable by design. Its security comes from cost and scrutiny — not obscurity.
 
 ---
 
