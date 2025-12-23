@@ -1,34 +1,36 @@
 // kanashift_app/src/main.rs
-
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
 use eframe::egui::{FontData, FontDefinitions, FontFamily};
+use std::sync::mpsc::{self, Receiver};
 
 use kanashift::VerifiedResult;
 
-use std::sync::mpsc::{self, Receiver};
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    Kan500kSkin,
-    Kan500ktSkin,
-    Kan500kJp,
-    Kan500kJpt,
+    Kan500k2Skin,
+    Kan500k2SkinT,
+    Kan500k2Jp,
+    Kan500k2JpT,
 }
 
 impl Mode {
     fn label(self) -> &'static str {
         match self {
-            Mode::Kan500kSkin => "KAN500K — base “JP-looking skin” (no verification)",
-            Mode::Kan500ktSkin => "KAN500KT — token-verified (adds chars per token)",
-            Mode::Kan500kJp => "KAN500KJP — JP-native base (no verification)",
-            Mode::Kan500kJpt => "KAN500KJPT — JP-native token-verified",
+            Mode::Kan500k2Skin => "KAN500K2 — skin base (kana-only header; no verification)",
+            Mode::Kan500k2SkinT => "KAN500K2T — skin token-verified (kana-only header)",
+            Mode::Kan500k2Jp => "KAN500K2JP — JP-native base (kana-only header; no verification)",
+            Mode::Kan500k2JpT => "KAN500K2JPT — JP-native token-verified (kana-only header)",
         }
     }
 
     fn is_verified(self) -> bool {
-        matches!(self, Mode::Kan500ktSkin | Mode::Kan500kJpt)
+        matches!(self, Mode::Kan500k2SkinT | Mode::Kan500k2JpT)
+    }
+
+    fn expects_k2(self) -> bool {
+        true
     }
 }
 
@@ -65,7 +67,7 @@ struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            mode: Mode::Kan500kSkin,
+            mode: Mode::Kan500k2Skin,
             check_chars: 1,
             shift_punct: true,
             input: "Testing KanaShift with mixed English content. 完了。".to_string(),
@@ -73,7 +75,7 @@ impl Default for AppState {
             password: "correct horse battery staple".to_string(),
             iterations: 500_000,
             salt: "NameFPE:v1".to_string(),
-            status: "Tip: Encode writes to Output. Decode reads from Input. KT modes can verify wrong parameters."
+            status: "Tip: Encode writes to Output. Decode reads from Input. T modes can verify wrong parameters."
                 .to_string(),
 
             busy: false,
@@ -114,34 +116,34 @@ impl AppState {
         std::thread::spawn(move || {
             let res = std::panic::catch_unwind(|| match (job, mode) {
                 // ----------------------
-                // ENCODE
+                // ENCODE (KAN500K2)
                 // ----------------------
-                (WorkerJob::Encode, Mode::Kan500kSkin) => WorkerResult {
-                    output: kanashift::rot500k_skin_encrypt(&inp, &pw, it, &salt, sp),
-                    status: "Encoded. (No verification in KAN500K)".to_string(),
+                (WorkerJob::Encode, Mode::Kan500k2Skin) => WorkerResult {
+                    output: kanashift::kan500k2_skin_encrypt(&inp, &pw, it, &salt, sp),
+                    status: "Encoded. (No verification in KAN500K2)".to_string(),
                 },
-                (WorkerJob::Encode, Mode::Kan500ktSkin) => match kanashift::rot500kt_skin_encrypt(
+                (WorkerJob::Encode, Mode::Kan500k2SkinT) => match kanashift::kan500k2_skin_t_encrypt(
                     &inp, &pw, it, &salt, cc, sp,
                 ) {
                     Ok(v) => WorkerResult {
                         output: v,
-                        status: "Encoded (KAN500KT).".to_string(),
+                        status: "Encoded (KAN500K2T).".to_string(),
                     },
                     Err(e) => WorkerResult {
                         output: String::new(),
                         status: format!("Error: {e}"),
                     },
                 },
-                (WorkerJob::Encode, Mode::Kan500kJp) => WorkerResult {
-                    output: kanashift::rot500kjp_encrypt(&inp, &pw, it, &salt, sp),
-                    status: "Encoded. (No verification in KAN500KJP)".to_string(),
+                (WorkerJob::Encode, Mode::Kan500k2Jp) => WorkerResult {
+                    output: kanashift::kan500k2_jp_encrypt(&inp, &pw, it, &salt, sp),
+                    status: "Encoded. (No verification in KAN500K2JP)".to_string(),
                 },
-                (WorkerJob::Encode, Mode::Kan500kJpt) => match kanashift::rot500k_jpt_encrypt(
+                (WorkerJob::Encode, Mode::Kan500k2JpT) => match kanashift::kan500k2_jp_t_encrypt(
                     &inp, &pw, it, &salt, cc, sp,
                 ) {
                     Ok(v) => WorkerResult {
                         output: v,
-                        status: "Encoded (KAN500KJPT).".to_string(),
+                        status: "Encoded (KAN500K2JPT).".to_string(),
                     },
                     Err(e) => WorkerResult {
                         output: String::new(),
@@ -150,40 +152,60 @@ impl AppState {
                 },
 
                 // ----------------------
-                // DECODE
+                // DECODE (KAN500K2)
                 // ----------------------
-                (WorkerJob::Decode, Mode::Kan500kSkin) => WorkerResult {
-                    output: kanashift::rot500k_skin_decrypt(&inp, &pw, it, &salt, sp),
-                    status: "Decoded. (No verification in KAN500K)".to_string(),
+                (WorkerJob::Decode, Mode::Kan500k2Skin) => match kanashift::kan500k2_skin_decrypt(&inp, &pw, it, &salt, sp)
+                {
+                    Ok(v) => WorkerResult {
+                        output: v,
+                        status: "Decoded. (No verification in KAN500K2)".to_string(),
+                    },
+                    Err(e) => WorkerResult {
+                        output: String::new(),
+                        status: format!("Error: {e}"),
+                    },
                 },
-                (WorkerJob::Decode, Mode::Kan500ktSkin) => {
-                    let VerifiedResult { ok, value } =
-                        kanashift::rot500kt_skin_decrypt(&inp, &pw, it, &salt, cc, sp);
-                    WorkerResult {
+                (WorkerJob::Decode, Mode::Kan500k2SkinT) => match kanashift::kan500k2_skin_t_decrypt(
+                    &inp, &pw, it, &salt, cc, sp,
+                ) {
+                    Ok(VerifiedResult { ok, value }) => WorkerResult {
                         output: value,
                         status: format!("Decoded. Verified: {}", if ok { "OK" } else { "FAILED" }),
-                    }
-                }
-                (WorkerJob::Decode, Mode::Kan500kJp) => WorkerResult {
-                    output: kanashift::rot500kjp_decrypt(&inp, &pw, it, &salt, sp),
-                    status: "Decoded. (No verification in KAN500KJP)".to_string(),
+                    },
+                    Err(e) => WorkerResult {
+                        output: String::new(),
+                        status: format!("Error: {e}"),
+                    },
                 },
-                (WorkerJob::Decode, Mode::Kan500kJpt) => {
-                    let VerifiedResult { ok, value } =
-                        kanashift::rot500k_jpt_decrypt(&inp, &pw, it, &salt, cc, sp);
-                    WorkerResult {
+                (WorkerJob::Decode, Mode::Kan500k2Jp) => match kanashift::kan500k2_jp_decrypt(&inp, &pw, it, &salt, sp) {
+                    Ok(v) => WorkerResult {
+                        output: v,
+                        status: "Decoded. (No verification in KAN500K2JP)".to_string(),
+                    },
+                    Err(e) => WorkerResult {
+                        output: String::new(),
+                        status: format!("Error: {e}"),
+                    },
+                },
+                (WorkerJob::Decode, Mode::Kan500k2JpT) => match kanashift::kan500k2_jp_t_decrypt(
+                    &inp, &pw, it, &salt, cc, sp,
+                ) {
+                    Ok(VerifiedResult { ok, value }) => WorkerResult {
                         output: value,
                         status: format!("Decoded. Verified: {}", if ok { "OK" } else { "FAILED" }),
-                    }
-                }
+                    },
+                    Err(e) => WorkerResult {
+                        output: String::new(),
+                        status: format!("Error: {e}"),
+                    },
+                },
             });
 
             let msg = match res {
                 Ok(v) => v,
                 Err(_) => WorkerResult {
                     output: String::new(),
-                    status: "PANIC in worker thread (run debug build in a terminal with RUST_BACKTRACE=1)."
-                        .to_string(),
+                    status: "PANIC in worker thread (debug build + RUST_BACKTRACE=1).".to_string(),
                 },
             };
 
@@ -194,6 +216,20 @@ impl AppState {
     fn swap(&mut self) {
         std::mem::swap(&mut self.input, &mut self.output);
         self.status = "Swapped.".to_string();
+    }
+
+    fn header_preview(&self) -> String {
+        // KAN500K2 kana-only header is always 19 kana chars.
+        // We avoid parsing here; just show the first N chars if available.
+        let s = self.output.trim();
+        let head: String = s.chars().take(19).collect();
+        if head.is_empty() {
+            "—".to_string()
+        } else if s.chars().count() < 19 {
+            format!("{head}… (incomplete)")
+        } else {
+            head
+        }
     }
 }
 
@@ -215,10 +251,10 @@ impl eframe::App for AppState {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("KanaShift — Desktop Demo (Rust)");
+            ui.heading("KanaShift — Desktop Demo (Rust, KAN500K2)");
 
             ui.add_space(6.0);
-            ui.label("KanaShift (a KAN500K mod) — PBKDF2-driven format-preserving obfuscation. Default is 500,000 iterations.");
+            ui.label("KAN500K2 patch: per-message nonce + PBKDF2-derived MAC key (T modes) + kana-only stealth header (no fixed ASCII prefix/separators).");
 
             ui.add_space(10.0);
 
@@ -229,18 +265,26 @@ impl eframe::App for AppState {
                     .selected_text(self.mode.label())
                     .show_ui(ui, |ui| {
                         for m in [
-                            Mode::Kan500kSkin,
-                            Mode::Kan500ktSkin,
-                            Mode::Kan500kJp,
-                            Mode::Kan500kJpt,
+                            Mode::Kan500k2Skin,
+                            Mode::Kan500k2SkinT,
+                            Mode::Kan500k2Jp,
+                            Mode::Kan500k2JpT,
                         ] {
                             ui.selectable_value(&mut self.mode, m, m.label());
                         }
                     });
 
                 ui.add_space(14.0);
-                ui.label("Token check chars (KT):");
-                ui.add(egui::DragValue::new(&mut self.check_chars).range(1..=16));
+
+                ui.add_enabled_ui(self.mode.is_verified(), |ui| {
+                    ui.label("Token check chars (T):");
+                    ui.add(egui::DragValue::new(&mut self.check_chars).range(1..=16));
+                });
+
+                if !self.mode.is_verified() {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("—").weak());
+                }
             });
 
             ui.add_space(6.0);
@@ -306,6 +350,14 @@ impl eframe::App for AppState {
                     .desired_width(f32::INFINITY),
             );
 
+            ui.add_space(8.0);
+
+            // Small K2 header hint (stealth header preview)
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Stealth header (first 19 chars):").weak());
+                ui.monospace(self.header_preview());
+            });
+
             ui.add_space(10.0);
             ui.separator();
             ui.label(&self.status);
@@ -342,8 +394,8 @@ fn setup_fonts(ctx: &egui::Context) {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("KanaShift — Rust Desktop Demo")
-            .with_inner_size([900.0, 520.0]),
+            .with_title("KanaShift — Rust Desktop Demo (KAN500K2)")
+            .with_inner_size([920.0, 560.0]),
         ..Default::default()
     };
 

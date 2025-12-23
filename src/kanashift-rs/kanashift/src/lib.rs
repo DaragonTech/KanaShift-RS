@@ -1,13 +1,29 @@
-//! kanashift — Rust port of KanaShift demo logic (skin + JP-native + KT)
+//! kanashift — Rust port of KanaShift demo logic (skin + JP-native + KT) — KAN500K2 generation
 //!
-//! Notes:
-//! - Uses PBKDF2-HMAC-SHA256 keystream (like your demo).
-//! - Uses codepoint ranges for fullwidth digits to avoid encoding/mojibake issues.
-//! - Keeps kana/kanji sets as UTF-8 string literals (save this file as UTF-8).
+//! KAN500K2 security patches (vs 1.x):
+//!  1) Per-message nonce mixed into PBKDF2 salt (domain-separated) => prevents keystream reuse across messages
+//!  2) Verified modes derive MAC key via PBKDF2 (domain-separated, nonce-aware) => no fast HMAC password oracle
+//!  3) Stealth wire format: **kana-only**, no fixed ASCII prefix or separators
+//!     - Header packs mode + nonce and is Kana64-encoded
+//!     - Payload is Kana64-encoded UTF-8 bytes of the (already kana) ciphertext
+//!
+//! Wire format (all kana chars from KANA64):
+//!   <HEADER_KANA64><PAYLOAD_KANA64>
+//!   - Header is fixed length (19 chars): encodes 14 bytes = [r0, r1(masked mode), nonce(12)]
+//!   - Payload is variable length (UTF-8 bytes Kana64 encoded)
+//!
+//! Cargo.toml deps (typical):
+//!   pbkdf2 = "0.12"
+//!   hmac = "0.12"
+//!   sha2 = "0.10"
+//!   rand = "0.8"
 
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use sha2::Sha256;
+use std::collections::HashMap;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -15,6 +31,164 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct VerifiedResult {
     pub ok: bool,
     pub value: String,
+}
+
+// ============================================================
+// KANA64 (kana-only "base64") helpers
+// ============================================================
+
+// IMPORTANT: must be exactly 64 chars.
+const KANA64: &str =
+    "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん\
+     アイウエオカキクケコサシスセソタチツ";
+
+fn kana64_tables() -> (Vec<char>, HashMap<char, u8>) {
+    let chars: Vec<char> = KANA64.chars().collect();
+    if chars.len() != 64 {
+        panic!("KANA64 must be exactly 64 chars (got {})", chars.len());
+    }
+    let mut map = HashMap::with_capacity(64);
+    for (i, c) in chars.iter().enumerate() {
+        map.insert(*c, i as u8);
+    }
+    (chars, map)
+}
+
+fn kana64_encode(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let (enc, _) = kana64_tables();
+
+    let mut out = String::new();
+    let mut acc: u32 = 0;
+    let mut acc_bits: u32 = 0;
+
+    for &b in bytes {
+        acc = (acc << 8) | (b as u32);
+        acc_bits += 8;
+
+        while acc_bits >= 6 {
+            acc_bits -= 6;
+            let v = ((acc >> acc_bits) & 0x3F) as usize;
+            out.push(enc[v]);
+        }
+    }
+
+    if acc_bits > 0 {
+        let v = ((acc << (6 - acc_bits)) & 0x3F) as usize;
+        out.push(enc[v]);
+    }
+
+    out
+}
+
+fn kana64_decode(s: &str) -> Result<Vec<u8>, String> {
+    if s.is_empty() {
+        return Ok(vec![]);
+    }
+    let (_, dec) = kana64_tables();
+
+    let mut out: Vec<u8> = Vec::with_capacity((s.chars().count() * 6 + 7) / 8);
+
+    let mut acc: u32 = 0;
+    let mut acc_bits: u32 = 0;
+
+    for c in s.chars() {
+        let Some(v) = dec.get(&c) else {
+            return Err(format!("Kana64 decode: invalid char {:?}", c));
+        };
+        acc = (acc << 6) | (*v as u32);
+        acc_bits += 6;
+
+        while acc_bits >= 8 {
+            acc_bits -= 8;
+            let b = ((acc >> acc_bits) & 0xFF) as u8;
+            out.push(b);
+        }
+    }
+
+    Ok(out)
+}
+
+// ============================================================
+// KAN500K2 wire format header (kana-only, fixed size)
+// ============================================================
+
+const NONCE_LEN: usize = 12; // 96-bit
+const HDR_BYTES: usize = 2 + NONCE_LEN; // r0 + r1(masked mode) + nonce
+const HDR_KANA_LEN: usize = 19; // ceil(HDR_BYTES*8/6) = ceil(112/6) = 19
+
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Mode {
+    SkinBase = 0,
+    SkinT = 1,
+    JpBase = 2,
+    JpT = 3,
+}
+
+fn gen_nonce() -> [u8; NONCE_LEN] {
+    let mut n = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut n);
+    n
+}
+
+fn pack_header(mode: Mode, nonce: &[u8; NONCE_LEN]) -> String {
+    // Option B (masked mode byte):
+    // - byte0 = random
+    // - byte1 = (mode_bits XOR byte0)
+    let mut r0 = [0u8; 1];
+    OsRng.fill_bytes(&mut r0);
+    let r0 = r0[0];
+
+    let mode_bits = mode as u8;
+    let b1 = mode_bits ^ r0;
+
+    let mut hdr = [0u8; HDR_BYTES];
+    hdr[0] = r0;
+    hdr[1] = b1;
+    hdr[2..].copy_from_slice(nonce);
+
+    let s = kana64_encode(&hdr);
+    // Defensive: this should be fixed length (19)
+    if s.chars().count() != HDR_KANA_LEN {
+        panic!(
+            "Internal error: header kana length expected {}, got {}",
+            HDR_KANA_LEN,
+            s.chars().count()
+        );
+    }
+    s
+}
+
+fn unpack_header(s: &str) -> Result<(Mode, [u8; NONCE_LEN]), String> {
+    let hdr_kana: String = s.chars().take(HDR_KANA_LEN).collect();
+    if hdr_kana.chars().count() != HDR_KANA_LEN {
+        return Err("Ciphertext too short (missing header)".to_string());
+    }
+
+    let hdr_bytes = kana64_decode(&hdr_kana)?;
+    if hdr_bytes.len() < HDR_BYTES {
+        return Err("Header decode failed (too few bytes)".to_string());
+    }
+
+    let r0 = hdr_bytes[0];
+    let b1 = hdr_bytes[1];
+    let mode_bits = b1 ^ r0;
+
+    let mode = match mode_bits & 0x03 {
+        0 => Mode::SkinBase,
+        1 => Mode::SkinT,
+        2 => Mode::JpBase,
+        3 => Mode::JpT,
+        _ => return Err("Invalid mode bits".to_string()),
+    };
+
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&hdr_bytes[2..2 + NONCE_LEN]);
+
+    Ok((mode, nonce))
 }
 
 // ============================================================
@@ -29,7 +203,7 @@ fn is_digit(ch: char) -> bool {
     ('0'..='9').contains(&ch)
 }
 
-/// Fullwidth digits U+FF10..U+FF19 (０..９) — avoids relying on literal chars.
+/// Fullwidth digits U+FF10..U+FF19 (０..９)
 fn is_fullwidth_digit(ch: char) -> bool {
     let cp = ch as u32;
     (0xFF10..=0xFF19).contains(&cp)
@@ -96,20 +270,28 @@ fn rotate_in_set_allow_zero(set_chars: &str, ch: char, shift: i32) -> char {
     chars[j]
 }
 
+fn dsalt(base_salt: &str, nonce_tag: &str, domain: &str) -> String {
+    // Domain-separated salt builder (nonce-aware)
+    format!("{base_salt}|{domain}|n={nonce_tag}")
+}
+
 fn pbkdf2_keystream(password: &str, salt: &str, iterations: u32, need_bytes: usize) -> Vec<u8> {
     let need = need_bytes.max(32);
     let mut out = vec![0u8; need];
-    pbkdf2_hmac::<Sha256>(
-        password.as_bytes(),
-        salt.as_bytes(),
-        iterations.max(1),
-        &mut out,
-    );
+    pbkdf2_hmac::<Sha256>(password.as_bytes(), salt.as_bytes(), iterations.max(1), &mut out);
     out
 }
 
-fn hmac_sha256_bytes(key: &str, msg: &str) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC key");
+fn derive_hmac_key_bytes(password: &str, base_salt: &str, iterations: u32, nonce_tag: &str, domain: &str) -> [u8; 32] {
+    let mac_salt = dsalt(base_salt, nonce_tag, &format!("HMACKey:{domain}"));
+    let ks = pbkdf2_keystream(password, &mac_salt, iterations, 32);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&ks[..32]);
+    out
+}
+
+fn hmac_sha256_bytes_keyed(key: &[u8; 32], msg: &str) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key");
     mac.update(msg.as_bytes());
     let res = mac.finalize().into_bytes();
     let mut out = [0u8; 32];
@@ -171,7 +353,7 @@ fn punct_translate(s: &str, direction: i32) -> String {
 }
 
 // ============================================================
-// Keyed JP punctuation shifting (glyph sets)
+// Keyed JP punctuation shifting (glyph sets) — nonce-aware
 // ============================================================
 
 const P_END: &str = "！？";
@@ -181,7 +363,7 @@ fn is_shift_punct(c: char) -> bool {
     P_END.chars().any(|x| x == c) || P_MID.chars().any(|x| x == c)
 }
 
-fn punct_shift_apply(s: &str, password: &str, iterations: u32, salt: &str, direction: i32) -> String {
+fn punct_shift_apply(s: &str, password: &str, iterations: u32, salt: &str, nonce_tag: &str, direction: i32) -> String {
     if s.is_empty() {
         return s.to_string();
     }
@@ -191,7 +373,8 @@ fn punct_shift_apply(s: &str, password: &str, iterations: u32, salt: &str, direc
         return s.to_string();
     }
 
-    let ks = pbkdf2_keystream(password, &format!("{salt}|PunctShiftJP:v2"), iterations, need + 64);
+    let ks_salt = dsalt(salt, nonce_tag, "PunctShiftJP:v2");
+    let ks = pbkdf2_keystream(password, &ks_salt, iterations, need + 64);
     let mut kpos = 0usize;
 
     let mut out: Vec<char> = s.chars().collect();
@@ -213,10 +396,10 @@ fn punct_shift_apply(s: &str, password: &str, iterations: u32, salt: &str, direc
 }
 
 // ============================================================
-// FAMILY A: “skin” (Latin/PT -> kana render), case-preserving
+// FAMILY A: “skin” (Latin/PT -> kana render), case-preserving — nonce-aware
 // ============================================================
 
-fn skin_transform(text: &str, password: &str, iterations: u32, salt: &str, direction: i32) -> String {
+fn skin_transform(text: &str, password: &str, iterations: u32, salt: &str, nonce_tag: &str, direction: i32) -> String {
     // Plain (ASCII)
     const P_VOW_LO: &str = "aeiou";
     const P_VOW_UP: &str = "AEIOU";
@@ -227,7 +410,7 @@ fn skin_transform(text: &str, password: &str, iterations: u32, salt: &str, direc
     const P_VOW_LO_PT: &str = "áàâãäéèêëíìîïóòôõöúùûü";
     const P_VOW_UP_PT: &str = "ÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜ";
 
-    // Cedilla markers (match your HTML demo)
+    // Cedilla markers
     const C_CED_LO: char = 'ゞ'; // for 'ç'
     const C_CED_UP: char = 'ヾ'; // for 'Ç'
 
@@ -248,7 +431,8 @@ fn skin_transform(text: &str, password: &str, iterations: u32, salt: &str, direc
     }
 
     let chars: Vec<char> = text.chars().collect();
-    let ks = pbkdf2_keystream(password, salt, iterations, chars.len() + 64);
+    let core_salt = dsalt(salt, nonce_tag, "SkinFPE:v2");
+    let ks = pbkdf2_keystream(password, &core_salt, iterations, chars.len() + 64);
     let mut kpos = 0usize;
 
     let map_rotate =
@@ -302,7 +486,6 @@ fn skin_transform(text: &str, password: &str, iterations: u32, salt: &str, direc
         }
 
         if direction > 0 {
-            // ASCII lowercase -> hiragana
             if P_VOW_LO.contains(c) {
                 out.push(map_rotate(P_VOW_LO, C_VOW_LO, c, shift, 1).unwrap_or(c));
                 continue;
@@ -311,8 +494,6 @@ fn skin_transform(text: &str, password: &str, iterations: u32, salt: &str, direc
                 out.push(map_rotate(P_CON_LO, C_CON_LO, c, shift, 1).unwrap_or(c));
                 continue;
             }
-
-            // ASCII uppercase -> katakana
             if P_VOW_UP.contains(c) {
                 out.push(map_rotate(P_VOW_UP, C_VOW_UP, c, shift, 1).unwrap_or(c));
                 continue;
@@ -321,8 +502,6 @@ fn skin_transform(text: &str, password: &str, iterations: u32, salt: &str, direc
                 out.push(map_rotate(P_CON_UP, C_CON_UP, c, shift, 1).unwrap_or(c));
                 continue;
             }
-
-            // Accented vowels
             if P_VOW_LO_PT.contains(c) {
                 out.push(map_rotate(P_VOW_LO_PT, C_ACC_LO, c, shift, 1).unwrap_or(c));
                 continue;
@@ -331,8 +510,6 @@ fn skin_transform(text: &str, password: &str, iterations: u32, salt: &str, direc
                 out.push(map_rotate(P_VOW_UP_PT, C_ACC_UP, c, shift, 1).unwrap_or(c));
                 continue;
             }
-
-            // Cedilla
             if c == 'ç' {
                 out.push(C_CED_LO);
                 continue;
@@ -341,10 +518,8 @@ fn skin_transform(text: &str, password: &str, iterations: u32, salt: &str, direc
                 out.push(C_CED_UP);
                 continue;
             }
-
             out.push(c);
         } else {
-            // Hiragana -> ASCII lowercase
             if C_VOW_LO.contains(c) {
                 out.push(map_rotate(P_VOW_LO, C_VOW_LO, c, shift, -1).unwrap_or(c));
                 continue;
@@ -353,8 +528,6 @@ fn skin_transform(text: &str, password: &str, iterations: u32, salt: &str, direc
                 out.push(map_rotate(P_CON_LO, C_CON_LO, c, shift, -1).unwrap_or(c));
                 continue;
             }
-
-            // Katakana -> ASCII uppercase
             if C_VOW_UP.contains(c) {
                 out.push(map_rotate(P_VOW_UP, C_VOW_UP, c, shift, -1).unwrap_or(c));
                 continue;
@@ -363,8 +536,6 @@ fn skin_transform(text: &str, password: &str, iterations: u32, salt: &str, direc
                 out.push(map_rotate(P_CON_UP, C_CON_UP, c, shift, -1).unwrap_or(c));
                 continue;
             }
-
-            // Accented vowels
             if C_ACC_LO.contains(c) {
                 out.push(map_rotate(P_VOW_LO_PT, C_ACC_LO, c, shift, -1).unwrap_or(c));
                 continue;
@@ -373,8 +544,6 @@ fn skin_transform(text: &str, password: &str, iterations: u32, salt: &str, direc
                 out.push(map_rotate(P_VOW_UP_PT, C_ACC_UP, c, shift, -1).unwrap_or(c));
                 continue;
             }
-
-            // Cedilla markers
             if c == C_CED_LO {
                 out.push('ç');
                 continue;
@@ -383,7 +552,6 @@ fn skin_transform(text: &str, password: &str, iterations: u32, salt: &str, direc
                 out.push('Ç');
                 continue;
             }
-
             out.push(c);
         }
     }
@@ -391,38 +559,8 @@ fn skin_transform(text: &str, password: &str, iterations: u32, salt: &str, direc
     out
 }
 
-pub fn rot500k_skin_encrypt(
-    text: &str,
-    password: &str,
-    iterations: u32,
-    salt: &str,
-    shift_punctuation: bool,
-) -> String {
-    let mut r = skin_transform(text, password, iterations, salt, 1);
-    r = punct_translate(&r, 1);
-    if shift_punctuation {
-        r = punct_shift_apply(&r, password, iterations, salt, 1);
-    }
-    r
-}
-
-pub fn rot500k_skin_decrypt(
-    text: &str,
-    password: &str,
-    iterations: u32,
-    salt: &str,
-    shift_punctuation: bool,
-) -> String {
-    let mut s = text.to_string();
-    if shift_punctuation {
-        s = punct_shift_apply(&s, password, iterations, salt, -1);
-    }
-    s = punct_translate(&s, -1);
-    skin_transform(&s, password, iterations, salt, -1)
-}
-
 // ============================================================
-// FAMILY B: JP-native (JP -> JP) + ASCII shifting
+// FAMILY B: JP-native (JP -> JP) + ASCII shifting — nonce-aware
 // ============================================================
 
 fn is_kanji(c: char) -> bool {
@@ -458,6 +596,7 @@ fn build_kana_set(lo: u32, hi: u32) -> String {
     (lo..=hi).filter_map(char::from_u32).collect()
 }
 
+// ASCII letters in JP-native: vowels within vowels, consonants within consonants, case preserved
 fn rotate_ascii_alpha_phono(c: char, shift: i32) -> char {
     const V: &str = "aeiou";
     const C: &str = "bcdfghjklmnpqrstvwxyz";
@@ -484,7 +623,7 @@ fn rotate_ascii_alpha_phono(c: char, shift: i32) -> char {
     c
 }
 
-fn jp_native_transform(text: &str, password: &str, iterations: u32, salt: &str, direction: i32) -> String {
+fn jp_native_transform(text: &str, password: &str, iterations: u32, salt: &str, nonce_tag: &str, direction: i32) -> String {
     if text.is_empty() {
         return text.to_string();
     }
@@ -493,12 +632,8 @@ fn jp_native_transform(text: &str, password: &str, iterations: u32, salt: &str, 
     let jp_kata = build_kana_set(0x30A1, 0x30FA);
 
     let chars: Vec<char> = text.chars().collect();
-    let ks = pbkdf2_keystream(
-        password,
-        &format!("{salt}|JPNative:v2|AsciiShift"),
-        iterations,
-        chars.len() + 64,
-    );
+    let core_salt = dsalt(salt, nonce_tag, "JPNative:v2|AsciiShift");
+    let ks = pbkdf2_keystream(password, &core_salt, iterations, chars.len() + 64);
     let mut kpos = 0usize;
 
     let mut out = String::with_capacity(text.len() * 2);
@@ -515,7 +650,7 @@ fn jp_native_transform(text: &str, password: &str, iterations: u32, salt: &str, 
         let shift = (ks[kpos] as i32) * direction;
         kpos = (kpos + 1) % ks.len();
 
-        // ASCII letters: PhonoShift-style
+        // ASCII letters
         if is_ascii_upper(c) || is_ascii_lower(c) {
             out.push(rotate_ascii_alpha_phono(c, shift));
             continue;
@@ -567,41 +702,11 @@ fn jp_native_transform(text: &str, password: &str, iterations: u32, salt: &str, 
     out
 }
 
-pub fn rot500kjp_encrypt(
-    text: &str,
-    password: &str,
-    iterations: u32,
-    salt: &str,
-    shift_punctuation: bool,
-) -> String {
-    let mut r = jp_native_transform(text, password, iterations, salt, 1);
-    r = punct_translate(&r, 1);
-    if shift_punctuation {
-        r = punct_shift_apply(&r, password, iterations, salt, 1);
-    }
-    r
-}
-
-pub fn rot500kjp_decrypt(
-    text: &str,
-    password: &str,
-    iterations: u32,
-    salt: &str,
-    shift_punctuation: bool,
-) -> String {
-    let mut s = text.to_string();
-    if shift_punctuation {
-        s = punct_shift_apply(&s, password, iterations, salt, -1);
-    }
-    s = punct_translate(&s, -1);
-    jp_native_transform(&s, password, iterations, salt, -1)
-}
-
 // ============================================================
-// KT Token Verification (shared)
+// KT Token Verification (shared) — nonce-aware, PBKDF2-derived MAC key
 // ============================================================
 
-pub fn is_token_sep(ch: char) -> bool {
+fn is_token_sep(ch: char) -> bool {
     matches!(
         ch,
         ' ' | '　' | '-' | '\'' |
@@ -634,22 +739,24 @@ fn make_token_check(kind: &str, mac: &[u8; 32], check_chars_per_token: usize) ->
 }
 
 fn token_digest(
-    password: &str,
+    mac_key: &[u8; 32],
     salt: &str,
     iterations: u32,
+    _nonce_tag: &str,            // keep param to avoid refactor churn, but unused
     token_index: usize,
     token_plain: &str,
     domain: &str,
 ) -> [u8; 32] {
     let msg = format!("{domain}|{salt}|{iterations}|{token_index}|{token_plain}");
-    hmac_sha256_bytes(password, &msg)
+    hmac_sha256_bytes_keyed(mac_key, &msg)
 }
 
 fn build_plain_token_checks<F: Fn(&str) -> String>(
     plain: &str,
-    password: &str,
+    mac_key: &[u8; 32],
     salt: &str,
     iterations: u32,
+    nonce_tag: &str,
     check_chars_per_token: usize,
     domain: &str,
     norm_fn: Option<&F>,
@@ -664,7 +771,7 @@ fn build_plain_token_checks<F: Fn(&str) -> String>(
         }
         let kind = if is_all_digits_anywidth(tok) { "digits" } else { "alpha" };
         let tnorm = if let Some(f) = norm_fn { f(tok) } else { tok.clone() };
-        let mac = token_digest(password, salt, iterations, *tok_idx, &tnorm, domain);
+        let mac = token_digest(mac_key, salt, iterations, nonce_tag, *tok_idx, &tnorm, domain);
         checks.push(make_token_check(kind, &mac, check_chars_per_token));
         *tok_idx += 1;
         tok.clear();
@@ -687,20 +794,19 @@ fn attach_checks_to_cipher(cipher: &str, checks: &[String]) -> Result<String, St
     let mut tok = String::new();
     let mut tok_idx = 0usize;
 
-    let flush =
-        |tok: &mut String, out: &mut String, tok_idx: &mut usize| -> Result<(), String> {
-            if tok.is_empty() {
-                return Ok(());
-            }
-            if *tok_idx >= checks.len() {
-                return Err("TokenTagged: token/check count mismatch.".to_string());
-            }
-            out.push_str(tok);
-            out.push_str(&checks[*tok_idx]);
-            *tok_idx += 1;
-            tok.clear();
-            Ok(())
-        };
+    let flush = |tok: &mut String, out: &mut String, tok_idx: &mut usize| -> Result<(), String> {
+        if tok.is_empty() {
+            return Ok(());
+        }
+        if *tok_idx >= checks.len() {
+            return Err("TokenTagged: token/check count mismatch.".to_string());
+        }
+        out.push_str(tok);
+        out.push_str(&checks[*tok_idx]);
+        *tok_idx += 1;
+        tok.clear();
+        Ok(())
+    };
 
     for c in cipher.chars() {
         if is_token_sep(c) {
@@ -759,17 +865,154 @@ fn strip_checks_from_tagged(tagged: &str, check_chars_per_token: usize) -> Optio
     Some((base, given))
 }
 
-// Domains from your HTML
-pub const TOK_DOMAIN_SKIN: &str = "KanaShiftTok:v2";
-pub const TOK_DOMAIN_JP: &str = "KanaShiftTokJP:v2";
+// Domains (bumped)
+pub const TOK_DOMAIN_SKIN: &str = "KanaShiftTok2";
+pub const TOK_DOMAIN_JP: &str = "KanaShiftTokJP2";
 
-// Token normalization hooks (identity in your current build)
+// Token normalization hooks (identity)
 fn norm_token_identity(s: &str) -> String {
     s.to_string()
 }
 
-// Shared KT wrappers (skin / JP)
-pub fn rot500kt_skin_encrypt(
+// ============================================================
+// KAN500K2 public APIs (kana-only wire format)
+// ============================================================
+
+fn pack_payload(mode: Mode, nonce: &[u8; NONCE_LEN], payload_text: &str) -> String {
+    let header = pack_header(mode, nonce);
+    format!("{header}{payload_text}")
+}
+
+fn unpack_payload(ciphertext: &str) -> Result<(Mode, [u8; NONCE_LEN], String), String> {
+    let total_chars = ciphertext.chars().count();
+    if total_chars < HDR_KANA_LEN + 1 {
+        return Err("Ciphertext too short".to_string());
+    }
+
+    let (mode, nonce) = unpack_header(ciphertext)?;
+
+    let payload_text: String = ciphertext.chars().skip(HDR_KANA_LEN).collect();
+    if payload_text.is_empty() {
+        return Err("Ciphertext missing payload".to_string());
+    }
+
+    Ok((mode, nonce, payload_text))
+}
+
+fn unpack_payload_tolerant_base(
+    s: &str,
+    expected_mode: Mode,
+    scan_limit: usize,
+) -> Result<(Mode, [u8; NONCE_LEN], String), String> {
+    let chars: Vec<char> = s.chars().collect();
+    let min_len = HDR_KANA_LEN + 1;
+    if chars.len() < min_len {
+        return Err("Ciphertext too short".to_string());
+    }
+
+    let limit = chars.len().min(scan_limit);
+
+    // need at least header+k64payload(>=1) after pos
+    for pos in 0..=limit.saturating_sub(min_len) {
+        let slice: String = chars[pos..].iter().collect();
+
+        // strict unpack on this suffix
+        if let Ok((mode, nonce, payload)) = unpack_payload(&slice) {
+            if mode == expected_mode {
+                return Ok((mode, nonce, payload));
+            }
+        }
+    }
+
+    Err("Invalid/legacy ciphertext.".to_string())
+}
+
+// Base (skin)
+pub fn kan500k2_skin_encrypt(
+    plain: &str,
+    password: &str,
+    iterations: u32,
+    salt: &str,
+    shift_punctuation: bool,
+) -> String {
+    let nonce = gen_nonce();
+    let nonce_tag = kana64_encode(&nonce);
+
+    let mut r = skin_transform(plain, password, iterations, salt, &nonce_tag, 1);
+    r = punct_translate(&r, 1);
+    if shift_punctuation {
+        r = punct_shift_apply(&r, password, iterations, salt, &nonce_tag, 1);
+    }
+
+    pack_payload(Mode::SkinBase, &nonce, &r)
+}
+
+pub fn kan500k2_skin_decrypt(
+    ciphertext: &str,
+    password: &str,
+    iterations: u32,
+    salt: &str,
+    shift_punctuation: bool,
+) -> Result<String, String> {
+let (mode, nonce, payload) =
+    unpack_payload_tolerant_base(ciphertext, Mode::SkinBase, 512)?;
+if mode != Mode::SkinBase {
+    return Err("Ciphertext mode mismatch (expected SkinBase)".to_string());
+}
+    let nonce_tag = kana64_encode(&nonce);
+
+    let mut s = payload;
+    if shift_punctuation {
+        s = punct_shift_apply(&s, password, iterations, salt, &nonce_tag, -1);
+    }
+    s = punct_translate(&s, -1);
+    Ok(skin_transform(&s, password, iterations, salt, &nonce_tag, -1))
+}
+
+// Base (JP-native)
+pub fn kan500k2_jp_encrypt(
+    plain: &str,
+    password: &str,
+    iterations: u32,
+    salt: &str,
+    shift_punctuation: bool,
+) -> String {
+    let nonce = gen_nonce();
+    let nonce_tag = kana64_encode(&nonce);
+
+    let mut r = jp_native_transform(plain, password, iterations, salt, &nonce_tag, 1);
+    r = punct_translate(&r, 1);
+    if shift_punctuation {
+        r = punct_shift_apply(&r, password, iterations, salt, &nonce_tag, 1);
+    }
+
+    pack_payload(Mode::JpBase, &nonce, &r)
+}
+
+pub fn kan500k2_jp_decrypt(
+    ciphertext: &str,
+    password: &str,
+    iterations: u32,
+    salt: &str,
+    shift_punctuation: bool,
+) -> Result<String, String> {
+let (mode, nonce, payload) =
+    unpack_payload_tolerant_base(ciphertext, Mode::JpBase, 512)?;
+if mode != Mode::JpBase {
+    return Err("Ciphertext mode mismatch (expected JpBase)".to_string());
+}
+    let nonce_tag = kana64_encode(&nonce);
+
+    let mut s = payload;
+    if shift_punctuation {
+        s = punct_shift_apply(&s, password, iterations, salt, &nonce_tag, -1);
+    }
+    s = punct_translate(&s, -1);
+    Ok(jp_native_transform(&s, password, iterations, salt, &nonce_tag, -1))
+}
+
+// Token-verified (skin)
+pub fn kan500k2_skin_t_encrypt(
     plain: &str,
     password: &str,
     iterations: u32,
@@ -777,12 +1020,18 @@ pub fn rot500kt_skin_encrypt(
     check_chars_per_token: usize,
     shift_punctuation: bool,
 ) -> Result<String, String> {
-    let cipher = skin_transform(plain, password, iterations, salt, 1);
+    let nonce = gen_nonce();
+    let nonce_tag = kana64_encode(&nonce);
+
+    let cipher = skin_transform(plain, password, iterations, salt, &nonce_tag, 1);
+
+    let mac_key = derive_hmac_key_bytes(password, salt, iterations, &nonce_tag, TOK_DOMAIN_SKIN);
     let checks = build_plain_token_checks(
         plain,
-        password,
+        &mac_key,
         salt,
         iterations,
+        &nonce_tag,
         check_chars_per_token,
         TOK_DOMAIN_SKIN,
         Some(&norm_token_identity),
@@ -791,53 +1040,64 @@ pub fn rot500kt_skin_encrypt(
 
     out = punct_translate(&out, 1);
     if shift_punctuation {
-        out = punct_shift_apply(&out, password, iterations, salt, 1);
+        out = punct_shift_apply(&out, password, iterations, salt, &nonce_tag, 1);
     }
-    Ok(out)
+
+    Ok(pack_payload(Mode::SkinT, &nonce, &out))
 }
 
-pub fn rot500kt_skin_decrypt(
-    tagged: &str,
+pub fn kan500k2_skin_t_decrypt(
+    ciphertext: &str,
     password: &str,
     iterations: u32,
     salt: &str,
     check_chars_per_token: usize,
     shift_punctuation: bool,
-) -> VerifiedResult {
-    let mut s = tagged.to_string();
+) -> Result<VerifiedResult, String> {
+    let (mode, nonce, payload) = unpack_payload(ciphertext)?;
+    if mode != Mode::SkinT {
+        return Err("Ciphertext mode mismatch (expected SkinT)".to_string());
+    }
+    let nonce_tag = kana64_encode(&nonce);
+
+    let mut s = payload;
     if shift_punctuation {
-        s = punct_shift_apply(&s, password, iterations, salt, -1);
+        s = punct_shift_apply(&s, password, iterations, salt, &nonce_tag, -1);
     }
     s = punct_translate(&s, -1);
 
     let Some((base_cipher, given_checks)) = strip_checks_from_tagged(&s, check_chars_per_token) else {
-        return VerifiedResult { ok: false, value: String::new() };
+        return Ok(VerifiedResult { ok: false, value: String::new() });
     };
 
-    let plain = skin_transform(&base_cipher, password, iterations, salt, -1);
+    let plain = skin_transform(&base_cipher, password, iterations, salt, &nonce_tag, -1);
+
+    let mac_key = derive_hmac_key_bytes(password, salt, iterations, &nonce_tag, TOK_DOMAIN_SKIN);
     let expected = build_plain_token_checks(
         &plain,
-        password,
+        &mac_key,
         salt,
         iterations,
+        &nonce_tag,
         check_chars_per_token,
         TOK_DOMAIN_SKIN,
         Some(&norm_token_identity),
     );
 
     if expected.len() != given_checks.len() {
-        return VerifiedResult { ok: false, value: String::new() };
+        return Ok(VerifiedResult { ok: false, value: String::new() });
     }
     for (a, b) in expected.iter().zip(given_checks.iter()) {
         if a != b {
-            return VerifiedResult { ok: false, value: String::new() };
+            return Ok(VerifiedResult { ok: false, value: String::new() });
         }
     }
 
-    VerifiedResult { ok: true, value: plain }
+    Ok(VerifiedResult { ok: true, value: plain })
 }
 
-pub fn rot500k_jpt_encrypt(
+// Token-verified (JP-native)
+pub fn kan500k2_jp_t_encrypt(
     plain: &str,
     password: &str,
     iterations: u32,
@@ -845,12 +1105,18 @@ pub fn rot500k_jpt_encrypt(
     check_chars_per_token: usize,
     shift_punctuation: bool,
 ) -> Result<String, String> {
-    let cipher = jp_native_transform(plain, password, iterations, salt, 1);
+    let nonce = gen_nonce();
+    let nonce_tag = kana64_encode(&nonce);
+
+    let cipher = jp_native_transform(plain, password, iterations, salt, &nonce_tag, 1);
+
+    let mac_key = derive_hmac_key_bytes(password, salt, iterations, &nonce_tag, TOK_DOMAIN_JP);
     let checks = build_plain_token_checks(
         plain,
-        password,
+        &mac_key,
         salt,
         iterations,
+        &nonce_tag,
         check_chars_per_token,
         TOK_DOMAIN_JP,
         Some(&norm_token_identity),
@@ -859,48 +1125,58 @@ pub fn rot500k_jpt_encrypt(
 
     out = punct_translate(&out, 1);
     if shift_punctuation {
-        out = punct_shift_apply(&out, password, iterations, salt, 1);
+        out = punct_shift_apply(&out, password, iterations, salt, &nonce_tag, 1);
     }
-    Ok(out)
+
+    Ok(pack_payload(Mode::JpT, &nonce, &out))
 }
 
-pub fn rot500k_jpt_decrypt(
-    tagged: &str,
+pub fn kan500k2_jp_t_decrypt(
+    ciphertext: &str,
     password: &str,
     iterations: u32,
     salt: &str,
     check_chars_per_token: usize,
     shift_punctuation: bool,
-) -> VerifiedResult {
-    let mut s = tagged.to_string();
+) -> Result<VerifiedResult, String> {
+    let (mode, nonce, payload) = unpack_payload(ciphertext)?;
+    if mode != Mode::JpT {
+        return Err("Ciphertext mode mismatch (expected JpT)".to_string());
+    }
+    let nonce_tag = kana64_encode(&nonce);
+
+    let mut s = payload;
     if shift_punctuation {
-        s = punct_shift_apply(&s, password, iterations, salt, -1);
+        s = punct_shift_apply(&s, password, iterations, salt, &nonce_tag, -1);
     }
     s = punct_translate(&s, -1);
 
     let Some((base_cipher, given_checks)) = strip_checks_from_tagged(&s, check_chars_per_token) else {
-        return VerifiedResult { ok: false, value: String::new() };
+        return Ok(VerifiedResult { ok: false, value: String::new() });
     };
 
-    let plain = jp_native_transform(&base_cipher, password, iterations, salt, -1);
+    let plain = jp_native_transform(&base_cipher, password, iterations, salt, &nonce_tag, -1);
+
+    let mac_key = derive_hmac_key_bytes(password, salt, iterations, &nonce_tag, TOK_DOMAIN_JP);
     let expected = build_plain_token_checks(
         &plain,
-        password,
+        &mac_key,
         salt,
         iterations,
+        &nonce_tag,
         check_chars_per_token,
         TOK_DOMAIN_JP,
         Some(&norm_token_identity),
     );
 
     if expected.len() != given_checks.len() {
-        return VerifiedResult { ok: false, value: String::new() };
+        return Ok(VerifiedResult { ok: false, value: String::new() });
     }
     for (a, b) in expected.iter().zip(given_checks.iter()) {
         if a != b {
-            return VerifiedResult { ok: false, value: String::new() };
+            return Ok(VerifiedResult { ok: false, value: String::new() });
         }
     }
 
-    VerifiedResult { ok: true, value: plain }
+    Ok(VerifiedResult { ok: true, value: plain })
 }

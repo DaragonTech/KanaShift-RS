@@ -1,4 +1,16 @@
 // phonoshift_app/src/main.rs
+//
+// Updated for ROT500K2 Family (stealth-framed ciphertext, strict decode):
+// - Modes renamed: ROT500K2 / ROT500K2V / ROT500K2T / ROT500K2P
+// - Encode always produces stealth-framed ciphertext (human-ish prefix header)
+// - Decode expects stealth-framed ciphertext; legacy ROT500K(1.x) strings will fail (by design)
+// - Token check chars only apply to T / V
+//
+// NOTE: this file assumes your phonoshift crate exports:
+//   rot500k2_encrypt, rot500k2_decrypt -> Result<String, String> for decrypt
+//   rot500k2t_encrypt, rot500k2t_decrypt -> Result<VerifiedResult, String>
+//   rot500k2p_encrypt, rot500k2p_decrypt -> Result<VerifiedResult, String>
+//   rot500k2v_encrypt, rot500k2v_decrypt -> Result<VerifiedResult, String>
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -9,24 +21,28 @@ use phonoshift::VerifiedResult;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    Rot500k,
-    Rot500kv,
-    Rot500kt,
-    Rot500kp,
+    Rot500k2,
+    Rot500k2v,
+    Rot500k2t,
+    Rot500k2p,
 }
 
 impl Mode {
     fn label(self) -> &'static str {
         match self {
-            Mode::Rot500k => "ROT500K — base (no length increase)",
-            Mode::Rot500kv => "ROT500KV — verified (auto, increases output)",
-            Mode::Rot500kt => "ROT500KT — token-verified (adds chars per token)",
-            Mode::Rot500kp => "ROT500KP — prefix-verified (adds prefix tag)",
+            Mode::Rot500k2 => "ROT500K2 — base (stealth-framed)",
+            Mode::Rot500k2v => "ROT500K2V — verified auto (stealth-framed)",
+            Mode::Rot500k2t => "ROT500K2T — token-verified (stealth-framed)",
+            Mode::Rot500k2p => "ROT500K2P — prefix-verified (stealth-framed)",
         }
     }
 
     fn is_verified(self) -> bool {
-        matches!(self, Mode::Rot500kv | Mode::Rot500kt | Mode::Rot500kp)
+        matches!(self, Mode::Rot500k2v | Mode::Rot500k2t | Mode::Rot500k2p)
+    }
+
+    fn wants_check_chars(self) -> bool {
+        matches!(self, Mode::Rot500k2v | Mode::Rot500k2t)
     }
 }
 
@@ -63,7 +79,7 @@ struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            mode: Mode::Rot500k,
+            mode: Mode::Rot500k2,
             check_chars: 1,
             shift_punct: true,
 
@@ -74,7 +90,7 @@ impl Default for AppState {
             iterations: 500_000,
             salt: "NameFPE:v1".to_string(),
 
-            status: "Tip: Encode writes to Output. Decode reads from Input. In verified modes, Decode can detect wrong parameters."
+            status: "Tip: Encode writes to Output. Decode reads from Input. ROT500K2 family expects stealth-framed ciphertext."
                 .to_string(),
             tab: 0,
 
@@ -111,83 +127,94 @@ impl AppState {
 
         std::thread::spawn(move || {
             let res = std::panic::catch_unwind(|| {
+let err = |e: String| WorkerResult {
+    output: String::new(),
+    status: format!("Error: {e}"),
+};
+
                 match (job, mode) {
                     // ----------------------
                     // ENCODE
                     // ----------------------
-                    (WorkerJob::Encode, Mode::Rot500k) => {
-                        let enc = phonoshift::rot500k_encrypt(&inp, &pw, it, &salt, sp);
-                        let dec = phonoshift::rot500k_decrypt(&enc, &pw, it, &salt, sp);
-                        let ok = dec == inp;
-                        WorkerResult {
-                            output: enc,
-                            status: format!(
-                                "Encoded. Self-check (ROT500K only): {}",
-                                if ok { "OK" } else { "FAILED" }
-                            ),
+                    (WorkerJob::Encode, Mode::Rot500k2) => {
+                        let enc = phonoshift::rot500k2_encrypt(&inp, &pw, it, &salt, sp);
+                        // Self-check (base only)
+                        match phonoshift::rot500k2_decrypt(&enc, &pw, it, &salt, sp) {
+                            Ok(dec) => WorkerResult {
+                                output: enc,
+                                status: format!(
+                                    "Encoded (ROT500K2). Self-check: {}",
+                                    if dec == inp { "OK" } else { "FAILED" }
+                                ),
+                            },
+                            Err(e) => err(e.to_string()),
                         }
                     }
-                    (WorkerJob::Encode, Mode::Rot500kp) => WorkerResult {
-                        output: phonoshift::rot500k_prefix_tagged(&inp, &pw, it, &salt, sp),
-                        status: "Encoded (ROT500KP).".to_string(),
+                    (WorkerJob::Encode, Mode::Rot500k2p) => WorkerResult {
+                        output: phonoshift::rot500k2p_encrypt(&inp, &pw, it, &salt, sp),
+                        status: "Encoded (ROT500K2P).".to_string(),
                     },
-                    (WorkerJob::Encode, Mode::Rot500kt) => match phonoshift::rot500k_token_tagged(
+                    (WorkerJob::Encode, Mode::Rot500k2t) => match phonoshift::rot500k2t_encrypt(
                         &inp, &pw, it, &salt, cc, sp,
                     ) {
                         Ok(v) => WorkerResult {
                             output: v,
-                            status: "Encoded (ROT500KT).".to_string(),
+                            status: "Encoded (ROT500K2T).".to_string(),
                         },
-                        Err(e) => WorkerResult {
-                            output: String::new(),
-                            status: format!("Error: {e}"),
-                        },
+                        Err(e) => err(e.to_string()),
                     },
-                    (WorkerJob::Encode, Mode::Rot500kv) => match phonoshift::rot500kv(
+                    (WorkerJob::Encode, Mode::Rot500k2v) => match phonoshift::rot500k2v_encrypt(
                         &inp, &pw, it, &salt, cc, sp,
                     ) {
                         Ok(v) => WorkerResult {
                             output: v,
-                            status: "Encoded (ROT500KV).".to_string(),
+                            status: "Encoded (ROT500K2V).".to_string(),
                         },
-                        Err(e) => WorkerResult {
-                            output: String::new(),
-                            status: format!("Error: {e}"),
-                        },
+                        Err(e) => err(e.to_string()),
                     },
 
                     // ----------------------
                     // DECODE
                     // ----------------------
-                    (WorkerJob::Decode, Mode::Rot500k) => WorkerResult {
-                        output: phonoshift::rot500k_decrypt(&inp, &pw, it, &salt, sp),
-                        status: "Decoded. (No verification in ROT500K)".to_string(),
+                    (WorkerJob::Decode, Mode::Rot500k2) => match phonoshift::rot500k2_decrypt(
+                        &inp, &pw, it, &salt, sp,
+                    ) {
+                        Ok(v) => WorkerResult {
+                            output: v,
+                            status: "Decoded. (No verification in ROT500K2)".to_string(),
+                        },
+                        Err(e) => err(e.to_string()),
                     },
-                    (WorkerJob::Decode, Mode::Rot500kp) => {
-                        let VerifiedResult { ok, value } =
-                            phonoshift::rot500k_prefix_tagged_decrypt(&inp, &pw, it, &salt, sp);
-                        WorkerResult {
+
+                    (WorkerJob::Decode, Mode::Rot500k2p) => match phonoshift::rot500k2p_decrypt(
+                        &inp, &pw, it, &salt, sp,
+                    ) {
+                        Ok(VerifiedResult { ok, value }) => WorkerResult {
                             output: value,
                             status: format!("Decoded. Verified: {}", if ok { "OK" } else { "FAILED" }),
-                        }
-                    }
-                    (WorkerJob::Decode, Mode::Rot500kt) => {
-                        let VerifiedResult { ok, value } = phonoshift::rot500k_token_tagged_decrypt(
-                            &inp, &pw, it, &salt, cc, sp,
-                        );
-                        WorkerResult {
+                        },
+                        Err(e) => err(e.to_string()),
+                    },
+
+                    (WorkerJob::Decode, Mode::Rot500k2t) => match phonoshift::rot500k2t_decrypt(
+                        &inp, &pw, it, &salt, cc, sp,
+                    ) {
+                        Ok(VerifiedResult { ok, value }) => WorkerResult {
                             output: value,
                             status: format!("Decoded. Verified: {}", if ok { "OK" } else { "FAILED" }),
-                        }
-                    }
-                    (WorkerJob::Decode, Mode::Rot500kv) => {
-                        let VerifiedResult { ok, value } =
-                            phonoshift::rot500kv_decrypt(&inp, &pw, it, &salt, cc, sp);
-                        WorkerResult {
+                        },
+                        Err(e) => err(e.to_string()),
+                    },
+
+                    (WorkerJob::Decode, Mode::Rot500k2v) => match phonoshift::rot500k2v_decrypt(
+                        &inp, &pw, it, &salt, cc, sp,
+                    ) {
+                        Ok(VerifiedResult { ok, value }) => WorkerResult {
                             output: value,
                             status: format!("Decoded. Verified: {}", if ok { "OK" } else { "FAILED" }),
-                        }
-                    }
+                        },
+                        Err(e) => err(e.to_string()),
+                    },
                 }
             });
 
@@ -229,7 +256,7 @@ impl eframe::App for AppState {
 
         egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("ROT500K Family (aka PhonoShift) — Desktop Demo (Rust)");
+                ui.heading("ROT500K2 Family (aka PhonoShift) — Desktop Demo (Rust)");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(8.0);
                     ui.selectable_value(&mut self.tab, 0, "Demo");
@@ -241,7 +268,10 @@ impl eframe::App for AppState {
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.tab == 0 {
                 ui.add_space(8.0);
-                ui.label("PhonoShift (ROT500K) is a keyed, format-preserving obfuscation scheme using PBKDF2-HMAC keystream. Default is 500,000 iterations.");
+                ui.label(
+                    "PhonoShift 2.x (ROT500K2) emits a stealth-framed ciphertext (human-ish header + payload). \
+                     Decrypt is strict: it expects a valid frame. Default is 500,000 PBKDF2 iterations.",
+                );
 
                 ui.add_space(12.0);
 
@@ -250,14 +280,22 @@ impl eframe::App for AppState {
                     egui::ComboBox::from_id_salt("mode_combo")
                         .selected_text(self.mode.label())
                         .show_ui(ui, |ui| {
-                            for m in [Mode::Rot500k, Mode::Rot500kv, Mode::Rot500kt, Mode::Rot500kp] {
+                            for m in [
+                                Mode::Rot500k2,
+                                Mode::Rot500k2v,
+                                Mode::Rot500k2t,
+                                Mode::Rot500k2p,
+                            ] {
                                 ui.selectable_value(&mut self.mode, m, m.label());
                             }
                         });
 
                     ui.add_space(14.0);
-                    ui.label("Token check chars (ROT500KT / ROT500KV):");
-                    ui.add(egui::DragValue::new(&mut self.check_chars).range(1..=16));
+
+                    ui.add_enabled_ui(self.mode.wants_check_chars(), |ui| {
+                        ui.label("Token check chars (ROT500K2T / ROT500K2V):");
+                        ui.add(egui::DragValue::new(&mut self.check_chars).range(1..=16));
+                    });
                 });
 
                 ui.add_space(6.0);
@@ -315,7 +353,14 @@ impl eframe::App for AppState {
 
                 ui.add_space(12.0);
 
-                ui.label("Output:");
+                ui.horizontal(|ui| {
+                    ui.label("Output:");
+                    if self.mode.is_verified() {
+                        ui.add_space(8.0);
+                        ui.label("(verified decode returns OK/FAILED)");
+                    }
+                });
+
                 ui.add(
                     egui::TextEdit::multiline(&mut self.output)
                         .desired_rows(4)
@@ -327,19 +372,31 @@ impl eframe::App for AppState {
                 ui.label(&self.status);
             } else {
                 ui.add_space(8.0);
-                ui.heading("About the ROT500K Family");
+                ui.heading("About the ROT500K2 Family");
 
                 ui.add_space(8.0);
-                ui.label("ROT500K keeps output length identical to input and preserves separators (space, -, ') and character classes (digits remain digits). It is reversible with the same password + salt + iterations.");
+                ui.label(
+                    "ROT500K2 keeps output length close to input (payload is format-preserving), but adds a stealth frame \
+                     header so ciphertext is self-identifying and carries a per-message nonce.",
+                );
 
                 ui.add_space(8.0);
-                ui.label("ROT500KV is the “verified” variant. It increases output to embed a keyed verification signal so decryption can return true/false. It auto-selects between:");
+                ui.label(
+                    "ROT500K2V is the verified auto mode. It increases output to embed a keyed verification signal and \
+                     auto-selects between:",
+                );
                 ui.add_space(4.0);
-                ui.label("• ROT500KT (token verification): appends 1+ characters per token");
-                ui.label("• ROT500KP (prefix verification): adds a short word-like prefix (good for short inputs)");
+                ui.label("• ROT500K2T (token verification): appends 1+ characters per token");
+                ui.label("• ROT500K2P (prefix verification): adds a short word-like prefix (good for short inputs)");
 
                 ui.add_space(8.0);
-                ui.label("Punctuation shifting (optional): only rotates within ¿¡ and !? (does not move punctuation positions).");
+                ui.label(
+                    "Security patches vs 1.x: per-message nonce mixed into PBKDF2 salt; verified modes use PBKDF2-derived \
+                     HMAC keys (domain-separated).",
+                );
+
+                ui.add_space(8.0);
+                ui.label("Punctuation shifting (optional): only rotates within ¿¡ and !? (does not move punctuation).");
             }
         });
     }
@@ -348,8 +405,8 @@ impl eframe::App for AppState {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("ROT500K / PhonoShift — Rust Desktop Demo")
-            .with_inner_size([980.0, 560.0]),
+            .with_title("ROT500K2 / PhonoShift — Rust Desktop Demo")
+            .with_inner_size([1000.0, 580.0]),
         ..Default::default()
     };
 
