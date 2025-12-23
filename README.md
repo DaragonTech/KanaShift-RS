@@ -4,19 +4,19 @@
 
 # KanaShift & PhonoShift
 
-**Reversible, format-preserving text transformation with a Japanese visual skin.
+**Reversible, password-bound text masking with a Japanese visual skin.  
 Looks Japanese. Means something else. Decodes back to the truth.**
 
 ## Overview
 
-KanaShift and its sibling PhonoShift (ROT500K) use a PBKDF2-derived keystream with 500,000 iterations, making every password guess deliberately expensive.
+KanaShift and its sibling **PhonoShift (ROT500K)** use a **PBKDF2-derived keystream (500,000 iterations by default)** to make every password guess deliberately expensive.
 
-This is not ROT13 repeated.
-It’s a keyed design where reversal without the secret is no longer trivial.
+This is not ROT13 repeated.  
+It is a keyed design where reversal without the secret requires paying a real computational cost.
 
-KanaShift applies the same hardened mechanics with kana and kanji, preserving structure while shifting the surface.
+KanaShift applies the same hardened mechanics with kana and kanji, preserving structure and token boundaries while transforming the visible surface into Japanese-looking text. Modern variants include a per-message nonce (with a masked header) to safely reuse passwords across messages.
 
-For performance reasons, use release builds, as debug compilation significantly affects runtime.
+For performance-sensitive use, prefer release builds—debug compilation can significantly affect runtime.
 
 ## Live Demos
 
@@ -78,26 +78,30 @@ Thanks to **Sea-Cardiologist-954** for identifying a critical weakness in v1. KA
 
 ## What This Is (and Is Not)
 
-KanaShift is not encryption. It’s a reversible, password-based masking system focused on format preservation, visual disguise, and recoverability.
+KanaShift is **not conventional encryption**. It is a reversible, password-based text masking scheme focused on **structure preservation, visual disguise, and recoverability**.
+
+It is designed for human-readable, structured text—not for providing semantic security over arbitrary natural language.
 
 ---
 
 ## Performance & Security
 
-A PBKDF2 - derived keystream imposes real cost per password guess (default 500K iterations), tuned for short, interactive text.
-Iterations can be lowered for batch use, trading resistance for throughput.
+A **PBKDF2-derived keystream** imposes a real cost per password guess (500K iterations by default), tuned for short, interactive text.
+The iteration count is configurable and can be lowered for batch use, trading brute-force resistance for throughput.
 
-KanaShift uses real crypto primitives but keeps output human-readable by design. Its security comes from cost and scrutiny — not obscurity.
+KanaShift uses standard cryptographic primitives, but intentionally keeps output readable and structured.
+Its security comes from **computational cost and public scrutiny**, not from obscurity or opaque ciphertext.
 
 ---
 
 ## Shared Core
 
 - Keyed and reversible (`password + salt + iterations`)
-- Format-preserving (keeps `space`, `-`, `'`)
-- Class-preserving rotation (no cross-class mapping, no zero-shifts)
-- PBKDF2-HMAC-SHA256 keystream
-- Optional verification (decode can return OK / FAILED)
+- Payload-level format preservation (keeps `space`, `-`, `'`)
+- Class-preserving rotations (no cross-class mapping, no zero-shifts)
+- PBKDF2-HMAC-SHA256–derived keystream
+- Per-message nonce to prevent keystream reuse (masked header)
+- Optional verification variants (decode can return **OK / FAILED**)
 
 ---
 
